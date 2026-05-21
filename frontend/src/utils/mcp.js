@@ -1,6 +1,7 @@
-// In dev: VITE_API_URL is unset → '' → Vite proxy forwards /api/* to localhost:8000
-// In prod: VITE_API_URL = 'https://your-app.up.railway.app' (set in Vercel dashboard)
-const BASE = `${import.meta.env.VITE_API_URL ?? ''}/api`;
+// Dev:  VITE_API_URL is unset → falls back to http://localhost:8000
+// Prod: set VITE_API_URL=https://your-app.up.railway.app in Vercel env vars (no trailing slash)
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const BASE = `${API_BASE}/api`;
 
 /** Call an MCP tool via the local API server. Returns the tool result (parsed). */
 export async function mcpCall(toolName, args = {}) {
