@@ -3,11 +3,12 @@ PRAGMA foreign_keys = ON;
 -- ─── Tables ───────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS students (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    name         TEXT    NOT NULL UNIQUE,
-    lesson_price REAL    NOT NULL DEFAULT 50.0,
-    active       INTEGER NOT NULL DEFAULT 1,
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT    NOT NULL UNIQUE,
+    lesson_price     REAL    NOT NULL DEFAULT 50.0,   -- legacy; kept for compat
+    price_per_lesson INTEGER NOT NULL DEFAULT 0,      -- lira per session (new)
+    active           INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 -- day_of_week: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
@@ -24,14 +25,16 @@ CREATE TABLE IF NOT EXISTS lessons (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id   INTEGER NOT NULL REFERENCES students(id),
     scheduled_at TEXT    NOT NULL,  -- ISO datetime
-    happened     INTEGER,           -- NULL=unconfirmed, 1=happened, 0=no-show/cancelled
+    happened     INTEGER,           -- NULL=unconfirmed, 1=happened, 0=cancelled/late-cancel
+    late_cancel  INTEGER NOT NULL DEFAULT 0,  -- 1=late cancellation (counts as session)
+    is_free      INTEGER NOT NULL DEFAULT 0,  -- 1=free lesson (no billing impact)
     paid         INTEGER NOT NULL DEFAULT 0,
     paid_at      TEXT,
     created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE (student_id, scheduled_at)
 );
 
--- amount in the same currency as lesson_price (e.g. prepaid, makeup credit)
+-- amount = session count (integer units), not currency
 CREATE TABLE IF NOT EXISTS credits (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id INTEGER NOT NULL REFERENCES students(id),
@@ -40,7 +43,6 @@ CREATE TABLE IF NOT EXISTS credits (
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
--- one row per payment event; total amount = lesson_price * number of lessons covered
 CREATE TABLE IF NOT EXISTS payments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id INTEGER NOT NULL REFERENCES students(id),
@@ -76,13 +78,40 @@ CREATE TABLE IF NOT EXISTS pending_requests (
     created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Trainer's recurring availability windows (when they can teach)
+CREATE TABLE IF NOT EXISTS trainer_availability (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+    start_time  TEXT    NOT NULL,  -- HH:MM
+    end_time    TEXT    NOT NULL,  -- HH:MM
+    active      INTEGER NOT NULL DEFAULT 1
+);
+
+-- Recurring blocks within availability (e.g. group class, doctor's appointment)
+CREATE TABLE IF NOT EXISTS trainer_blocks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    description TEXT    NOT NULL,
+    day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+    start_time  TEXT    NOT NULL,  -- HH:MM
+    end_time    TEXT    NOT NULL,  -- HH:MM
+    active      INTEGER NOT NULL DEFAULT 1
+);
+
+-- WhatsApp conversation sessions keyed by student phone number
+CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_number TEXT    NOT NULL UNIQUE,
+    messages     TEXT    NOT NULL DEFAULT '[]',  -- JSON array of {role, content}
+    updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ─── Seed: Students ───────────────────────────────────────────────────────────
 
-INSERT OR IGNORE INTO students (id, name, lesson_price)
-VALUES (1, 'Maria', 50.0);
+INSERT OR IGNORE INTO students (id, name, lesson_price, price_per_lesson)
+VALUES (1, 'Maria', 50.0, 500);
 
-INSERT OR IGNORE INTO students (id, name, lesson_price)
-VALUES (2, 'David', 50.0);
+INSERT OR IGNORE INTO students (id, name, lesson_price, price_per_lesson)
+VALUES (2, 'David', 50.0, 500);
 
 -- ─── Seed: Default Schedules ──────────────────────────────────────────────────
 
@@ -108,44 +137,44 @@ WHERE NOT EXISTS (SELECT 1 FROM schedules WHERE student_id = 2 AND day_of_week =
 -- Three weeks ago (week of 2026-05-04): confirmed and paid
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid, paid_at)
-VALUES (1, '2026-05-04 09:00:00', 1, 1, '2026-05-04 10:00:00');  -- Maria Mon
+VALUES (1, '2026-05-04 09:00:00', 1, 1, '2026-05-04 10:00:00');
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid, paid_at)
-VALUES (1, '2026-05-06 09:00:00', 1, 1, '2026-05-06 10:00:00');  -- Maria Wed
+VALUES (1, '2026-05-06 09:00:00', 1, 1, '2026-05-06 10:00:00');
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid, paid_at)
-VALUES (2, '2026-05-05 11:00:00', 1, 1, '2026-05-05 12:00:00');  -- David Tue
+VALUES (2, '2026-05-05 11:00:00', 1, 1, '2026-05-05 12:00:00');
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid)
-VALUES (2, '2026-05-07 11:00:00', 1, 0);                         -- David Thu (happened, unpaid)
+VALUES (2, '2026-05-07 11:00:00', 1, 0);
 
 -- Two weeks ago (week of 2026-05-11): confirmed but unpaid, plus one no-show
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid)
-VALUES (1, '2026-05-11 09:00:00', 1, 0);  -- Maria Mon
+VALUES (1, '2026-05-11 09:00:00', 1, 0);
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid)
-VALUES (1, '2026-05-13 09:00:00', 1, 0);  -- Maria Wed
+VALUES (1, '2026-05-13 09:00:00', 1, 0);
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid)
-VALUES (2, '2026-05-12 11:00:00', 1, 0);  -- David Tue
+VALUES (2, '2026-05-12 11:00:00', 1, 0);
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at, happened, paid)
-VALUES (2, '2026-05-14 11:00:00', 0, 0);  -- David Thu (no-show)
+VALUES (2, '2026-05-14 11:00:00', 0, 0);
 
 -- Last week (week of 2026-05-18): all unconfirmed
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at)
-VALUES (1, '2026-05-18 09:00:00');  -- Maria Mon
+VALUES (1, '2026-05-18 09:00:00');
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at)
-VALUES (1, '2026-05-20 09:00:00');  -- Maria Wed
+VALUES (1, '2026-05-20 09:00:00');
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at)
-VALUES (2, '2026-05-19 11:00:00');  -- David Tue
+VALUES (2, '2026-05-19 11:00:00');
 
 INSERT OR IGNORE INTO lessons (student_id, scheduled_at)
-VALUES (2, '2026-05-21 11:00:00');  -- David Thu (today, unconfirmed)
+VALUES (2, '2026-05-21 11:00:00');
 
 -- ─── Seed: Credits ────────────────────────────────────────────────────────────
 
@@ -163,3 +192,35 @@ WHERE NOT EXISTS (SELECT 1 FROM credits WHERE student_id = 2);
 INSERT INTO schedule_overrides (student_id, day_of_week, lesson_time, override_week)
 SELECT 2, 4, '11:00', '2026-05-25'
 WHERE NOT EXISTS (SELECT 1 FROM schedule_overrides WHERE student_id = 2);
+
+-- ─── Seed: Trainer Availability ───────────────────────────────────────────────
+-- Mon–Fri 08:00–20:00, Sat 09:00–14:00
+
+INSERT INTO trainer_availability (day_of_week, start_time, end_time)
+SELECT 0, '08:00', '20:00' WHERE NOT EXISTS (SELECT 1 FROM trainer_availability WHERE day_of_week = 0);
+
+INSERT INTO trainer_availability (day_of_week, start_time, end_time)
+SELECT 1, '08:00', '20:00' WHERE NOT EXISTS (SELECT 1 FROM trainer_availability WHERE day_of_week = 1);
+
+INSERT INTO trainer_availability (day_of_week, start_time, end_time)
+SELECT 2, '08:00', '20:00' WHERE NOT EXISTS (SELECT 1 FROM trainer_availability WHERE day_of_week = 2);
+
+INSERT INTO trainer_availability (day_of_week, start_time, end_time)
+SELECT 3, '08:00', '20:00' WHERE NOT EXISTS (SELECT 1 FROM trainer_availability WHERE day_of_week = 3);
+
+INSERT INTO trainer_availability (day_of_week, start_time, end_time)
+SELECT 4, '08:00', '20:00' WHERE NOT EXISTS (SELECT 1 FROM trainer_availability WHERE day_of_week = 4);
+
+INSERT INTO trainer_availability (day_of_week, start_time, end_time)
+SELECT 5, '09:00', '14:00' WHERE NOT EXISTS (SELECT 1 FROM trainer_availability WHERE day_of_week = 5);
+
+-- ─── Seed: Trainer Blocks ─────────────────────────────────────────────────────
+-- Wed 18:00–19:00 group class, Thu 11:00–12:00 doctor appointment
+
+INSERT INTO trainer_blocks (description, day_of_week, start_time, end_time)
+SELECT 'Grup dersi', 2, '18:00', '19:00'
+WHERE NOT EXISTS (SELECT 1 FROM trainer_blocks WHERE day_of_week = 2 AND description = 'Grup dersi');
+
+INSERT INTO trainer_blocks (description, day_of_week, start_time, end_time)
+SELECT 'Doktor', 3, '11:00', '12:00'
+WHERE NOT EXISTS (SELECT 1 FROM trainer_blocks WHERE day_of_week = 3 AND description = 'Doktor');

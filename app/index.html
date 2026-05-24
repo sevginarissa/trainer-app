@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Antrenör" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>Antrenör</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: { brand: '#6366f1' }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background:#0f172a; color:#e2e8f0; font-family: system-ui, sans-serif; }
+    #app { display:flex; flex-direction:column; height:100dvh; max-width:480px; margin:0 auto; }
+    .tab-panel { display:none; flex:1; overflow-y:auto; padding-bottom:72px; }
+    .tab-panel.active { display:flex; flex-direction:column; }
+    nav { position:fixed; bottom:0; left:50%; transform:translateX(-50%); width:100%; max-width:480px;
+          display:flex; background:#1e293b; border-top:1px solid #334155; z-index:50; }
+    nav button { flex:1; padding:12px 4px 16px; display:flex; flex-direction:column;
+                 align-items:center; gap:2px; font-size:10px; color:#94a3b8; border:none;
+                 background:transparent; cursor:pointer; transition:color .15s; }
+    nav button.active { color:#818cf8; }
+    nav button svg { width:22px; height:22px; }
+    .msg { max-width:80%; border-radius:12px; padding:10px 14px; margin:4px 0; font-size:14px; line-height:1.5; }
+    .msg-user { align-self:flex-end; background:#3730a3; color:#e0e7ff; }
+    .msg-ai { align-self:flex-start; background:#1e293b; color:#cbd5e1; }
+    .msg-error { align-self:flex-start; background:#7f1d1d; color:#fca5a5; }
+    .lesson-chip { border-radius:8px; padding:6px 10px; margin:2px 0; font-size:13px; display:flex; justify-content:space-between; align-items:center; }
+    .lesson-null { background:#1e293b; color:#94a3b8; }
+    .lesson-happened { background:#14532d; color:#86efac; }
+    .lesson-late-cancel { background:#431407; color:#fdba74; }
+    .lesson-cancelled { background:#1c1917; color:#78716c; }
+    .spinner { display:inline-block; width:18px; height:18px; border:2px solid #334155; border-top-color:#6366f1; border-radius:50%; animation:spin .7s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .btn { border-radius:8px; padding:8px 16px; font-size:14px; font-weight:500; cursor:pointer; border:none; transition:opacity .15s; }
+    .btn:hover { opacity:.85; }
+    .btn-primary { background:#4f46e5; color:#fff; }
+    .btn-ghost { background:#1e293b; color:#94a3b8; }
+    .btn-danger { background:#7f1d1d; color:#fca5a5; }
+    .card { background:#1e293b; border-radius:12px; padding:16px; margin:8px 12px; }
+    input[type=text], textarea { background:#0f172a; border:1px solid #334155; border-radius:8px;
+      padding:10px 12px; color:#e2e8f0; font-size:14px; width:100%; box-sizing:border-box; }
+    input[type=text]:focus, textarea:focus { outline:none; border-color:#6366f1; }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Chat ─────────────────────────────────────────────────────── -->
+  <div id="panel-chat" class="tab-panel active">
+    <div class="flex items-center gap-2 px-4 py-3 border-b border-slate-800 sticky top-0 bg-slate-900 z-10">
+      <span class="text-lg font-semibold">Antrenör</span>
+      <span id="chat-spinner" class="spinner ml-auto hidden"></span>
+    </div>
+    <div id="chat-messages" class="flex flex-col flex-1 p-3 gap-1 overflow-y-auto"></div>
+    <div class="fixed bottom-16 left-1/2 -translate-x-1/2 w-full max-w-[480px] px-3 py-2 bg-slate-900 border-t border-slate-800">
+      <div class="flex gap-2">
+        <input id="chat-input" type="text" placeholder="Mesaj yaz…" class="flex-1"
+          onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();sendChat()}" />
+        <button onclick="sendChat()" class="btn btn-primary">→</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Calendar ──────────────────────────────────────────────────── -->
+  <div id="panel-calendar" class="tab-panel">
+    <div class="flex items-center justify-between px-4 py-3 border-b border-slate-800 sticky top-0 bg-slate-900 z-10">
+      <button onclick="calPrev()" class="btn btn-ghost px-3">‹</button>
+      <span id="cal-title" class="font-semibold text-sm"></span>
+      <button onclick="calNext()" class="btn btn-ghost px-3">›</button>
+    </div>
+    <div id="cal-body" class="p-3"></div>
+  </div>
+
+  <!-- ── Students ──────────────────────────────────────────────────── -->
+  <div id="panel-students" class="tab-panel">
+    <div class="flex items-center px-4 py-3 border-b border-slate-800 sticky top-0 bg-slate-900 z-10">
+      <span class="font-semibold">Öğrenciler</span>
+      <span id="students-spinner" class="spinner ml-auto hidden"></span>
+    </div>
+    <div id="students-body" class="p-3"></div>
+  </div>
+
+  <!-- ── Balance ───────────────────────────────────────────────────── -->
+  <div id="panel-balance" class="tab-panel">
+    <div class="flex items-center justify-between px-4 py-3 border-b border-slate-800 sticky top-0 bg-slate-900 z-10">
+      <span class="font-semibold">Bakiye</span>
+      <button onclick="loadBalance()" class="text-xs text-indigo-400">Yenile</button>
+    </div>
+    <div id="balance-body" class="p-3"></div>
+  </div>
+
+  <!-- ── Bottom nav ─────────────────────────────────────────────────── -->
+  <nav>
+    <button id="nav-chat" class="active" onclick="showTab('chat')">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+      </svg>
+      Sohbet
+    </button>
+    <button id="nav-calendar" onclick="showTab('calendar')">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+      </svg>
+      Takvim
+    </button>
+    <button id="nav-students" onclick="showTab('students')">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+      </svg>
+      Öğrenciler
+    </button>
+    <button id="nav-balance" onclick="showTab('balance')">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+      Bakiye
+    </button>
+  </nav>
+
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

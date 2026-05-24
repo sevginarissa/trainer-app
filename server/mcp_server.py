@@ -22,6 +22,7 @@ def _db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -144,15 +145,34 @@ def _query_pending_requests(freed_date, freed_time, conn):
 
 
 def tool_mark_lesson(args):
+    """
+    3-state status model:
+      status="happened"    → happened=1, late_cancel=0
+      status="late_cancel" → happened=0, late_cancel=1  (counts as billable session)
+      status="cancelled"   → happened=0, late_cancel=0
+    Legacy boolean 'happened' field still accepted for backwards compat.
+    """
     lesson_id = args.get("lesson_id")
-    happened = args.get("happened")
-    if lesson_id is None or happened is None:
-        return _err("lesson_id and happened are required")
+    if lesson_id is None:
+        return _err("lesson_id is required")
+
+    status = args.get("status")
+    if status is not None:
+        if status == "happened":
+            happened, late_cancel = 1, 0
+        elif status == "late_cancel":
+            happened, late_cancel = 0, 1
+        else:
+            happened, late_cancel = 0, 0
+    else:
+        happened = 1 if args.get("happened") else 0
+        late_cancel = 0
+
     conn = _db()
     try:
         conn.execute(
-            "UPDATE lessons SET happened=? WHERE id=?",
-            (1 if happened else 0, lesson_id),
+            "UPDATE lessons SET happened=?, late_cancel=? WHERE id=?",
+            (happened, late_cancel, lesson_id),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM lessons WHERE id=?", (lesson_id,)).fetchone()
@@ -161,9 +181,9 @@ def tool_mark_lesson(args):
         result = dict(row)
         if not happened:
             scheduled_at = result.get("scheduled_at", "")
-            freed_date = scheduled_at[:10]
-            freed_time = scheduled_at[11:16]
-            result["freed_slot_matches"] = _query_pending_requests(freed_date, freed_time, conn)
+            result["freed_slot_matches"] = _query_pending_requests(
+                scheduled_at[:10], scheduled_at[11:16], conn
+            )
         return _ok(result)
     finally:
         conn.close()
@@ -330,35 +350,51 @@ def tool_generate_balance(args):
         credits_total = conn.execute(
             "SELECT COALESCE(SUM(amount),0) FROM credits WHERE student_id=?", (student_id,)
         ).fetchone()[0]
+        # Sessions that count for billing: happened OR late_cancel (not free)
+        sessions_occurred = conn.execute(
+            "SELECT COUNT(*) FROM lessons "
+            "WHERE student_id=? AND (happened=1 OR late_cancel=1) AND is_free=0",
+            (student_id,),
+        ).fetchone()[0]
         confirmed_paid = conn.execute(
-            "SELECT COUNT(*) FROM lessons WHERE student_id=? AND happened=1 AND paid=1", (student_id,)
+            "SELECT COUNT(*) FROM lessons "
+            "WHERE student_id=? AND happened=1 AND paid=1 AND is_free=0",
+            (student_id,),
         ).fetchone()[0]
         confirmed_unpaid = conn.execute(
-            "SELECT COUNT(*) FROM lessons WHERE student_id=? AND happened=1 AND paid=0", (student_id,)
+            "SELECT COUNT(*) FROM lessons "
+            "WHERE student_id=? AND happened=1 AND paid=0 AND is_free=0",
+            (student_id,),
+        ).fetchone()[0]
+        late_cancel_count = conn.execute(
+            "SELECT COUNT(*) FROM lessons WHERE student_id=? AND late_cancel=1",
+            (student_id,),
         ).fetchone()[0]
         unconfirmed = conn.execute(
             "SELECT COUNT(*) FROM lessons WHERE student_id=? AND happened IS NULL", (student_id,)
         ).fetchone()[0]
-        # All counts are in session units — no price multiplication
-        sessions_occurred = confirmed_paid + confirmed_unpaid
-        balance = int(credits_total) - sessions_occurred  # session units
+        balance = int(credits_total) - sessions_occurred
         unpaid_lesson_ids = [
             r[0] for r in conn.execute(
-                "SELECT id FROM lessons WHERE student_id=? AND happened=1 AND paid=0"
+                "SELECT id FROM lessons "
+                "WHERE student_id=? AND (happened=1 OR late_cancel=1) AND paid=0 AND is_free=0"
                 " ORDER BY scheduled_at ASC",
                 (student_id,),
             ).fetchall()
         ]
         return _ok({
-            "student_id": student_id, "student_name": student["name"],
-            "credits_total": int(credits_total),   # sessions of credit
+            "student_id":        student_id,
+            "student_name":      student["name"],
+            "price_per_lesson":  student["price_per_lesson"] if "price_per_lesson" in dict(student) else 0,
+            "credits_total":     int(credits_total),
             "sessions_occurred": sessions_occurred,
-            "balance": balance,                    # session units
-            "balance_status": "credit" if balance > 0 else ("owed" if balance < 0 else "settled"),
+            "balance":           balance,
+            "balance_status":    "credit" if balance > 0 else ("owed" if balance < 0 else "settled"),
             "lessons": {
-                "confirmed_paid": confirmed_paid,
+                "confirmed_paid":   confirmed_paid,
                 "confirmed_unpaid": confirmed_unpaid,
-                "unconfirmed": unconfirmed,
+                "late_cancel":      late_cancel_count,
+                "unconfirmed":      unconfirmed,
             },
             "unpaid_lesson_ids": unpaid_lesson_ids,
         })
@@ -620,6 +656,207 @@ def tool_update_pending_request(args):
         conn.close()
 
 
+def _time_to_min(t):
+    h, m = t.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _min_to_time(m):
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _subtract_intervals(avail, blocked):
+    result = list(avail)
+    for bs, be in blocked:
+        new_result = []
+        for s, e in result:
+            if be <= s or bs >= e:
+                new_result.append((s, e))
+            else:
+                if s < bs:
+                    new_result.append((s, bs))
+                if be < e:
+                    new_result.append((be, e))
+        result = new_result
+    return result
+
+
+def tool_record_payment(args):
+    student_id  = args.get("student_id")
+    amount_lira = args.get("amount_lira")
+    if student_id is None or amount_lira is None:
+        return _err("student_id and amount_lira are required")
+    amount_lira = int(amount_lira)
+    conn = _db()
+    try:
+        student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
+        if not student:
+            return _err(f"Student {student_id} not found")
+        student_dict = dict(student)
+        price = int(student_dict.get("price_per_lesson", 0))
+        if price <= 0:
+            return _err("price_per_lesson is 0 — set it first with update_student_price.")
+        lessons_to_pay = amount_lira // price
+        if lessons_to_pay <= 0:
+            return _err(f"amount_lira={amount_lira} is less than price_per_lesson={price}")
+        unpaid = conn.execute(
+            "SELECT id FROM lessons "
+            "WHERE student_id=? AND (happened=1 OR late_cancel=1) AND paid=0 AND is_free=0"
+            " ORDER BY scheduled_at ASC LIMIT ?",
+            (student_id, lessons_to_pay),
+        ).fetchall()
+        lesson_ids = [r[0] for r in unpaid]
+        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        cur = conn.execute(
+            "INSERT INTO payments (student_id, amount) VALUES (?,?)",
+            (student_id, len(lesson_ids)),
+        )
+        payment_id = cur.lastrowid
+        for lid in lesson_ids:
+            conn.execute("UPDATE lessons SET paid=1, paid_at=? WHERE id=?", (now, lid))
+            conn.execute(
+                "INSERT OR IGNORE INTO lesson_payments (payment_id, lesson_id) VALUES (?,?)",
+                (payment_id, lid),
+            )
+        conn.commit()
+        return _ok({
+            "payment_id":       payment_id,
+            "amount_lira":      amount_lira,
+            "price_per_lesson": price,
+            "lessons_paid":     len(lesson_ids),
+            "lesson_ids":       lesson_ids,
+        })
+    except Exception as e:
+        conn.rollback()
+        return _err(str(e))
+    finally:
+        conn.close()
+
+
+def tool_update_student_price(args):
+    student_id       = args.get("student_id")
+    price_per_lesson = args.get("price_per_lesson")
+    if student_id is None or price_per_lesson is None:
+        return _err("student_id and price_per_lesson are required")
+    conn = _db()
+    try:
+        conn.execute(
+            "UPDATE students SET price_per_lesson=? WHERE id=?",
+            (int(price_per_lesson), student_id),
+        )
+        conn.commit()
+        return _ok({"student_id": student_id, "price_per_lesson": int(price_per_lesson)})
+    finally:
+        conn.close()
+
+
+def tool_get_trainer_availability(_args):
+    conn = _db()
+    try:
+        return _ok(_rows(conn.execute(
+            "SELECT id, day_of_week, start_time, end_time, active "
+            "FROM trainer_availability ORDER BY day_of_week, start_time"
+        ).fetchall()))
+    finally:
+        conn.close()
+
+
+def tool_set_trainer_availability(args):
+    day   = args.get("day_of_week")
+    start = args.get("start_time")
+    end   = args.get("end_time")
+    if day is None or not start or not end:
+        return _err("day_of_week, start_time, and end_time are required")
+    conn = _db()
+    try:
+        conn.execute(
+            "UPDATE trainer_availability SET active=0 WHERE day_of_week=?", (day,)
+        )
+        conn.execute(
+            "INSERT INTO trainer_availability (day_of_week, start_time, end_time) VALUES (?,?,?)",
+            (day, start, end),
+        )
+        conn.commit()
+        return _ok({"day_of_week": day, "start_time": start, "end_time": end})
+    finally:
+        conn.close()
+
+
+def tool_add_trainer_block(args):
+    day   = args.get("day_of_week")
+    start = args.get("start_time")
+    end   = args.get("end_time")
+    if day is None or not start or not end:
+        return _err("day_of_week, start_time, and end_time are required")
+    conn = _db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO trainer_blocks (description, day_of_week, start_time, end_time) VALUES (?,?,?,?)",
+            (args.get("description", ""), day, start, end),
+        )
+        conn.commit()
+        return _ok(dict(conn.execute("SELECT * FROM trainer_blocks WHERE id=?", (cur.lastrowid,)).fetchone()))
+    finally:
+        conn.close()
+
+
+def tool_remove_trainer_block(args):
+    block_id = args.get("block_id")
+    if block_id is None:
+        return _err("block_id is required")
+    conn = _db()
+    try:
+        conn.execute("UPDATE trainer_blocks SET active=0 WHERE id=?", (block_id,))
+        conn.commit()
+        return _ok({"block_id": block_id, "active": 0})
+    finally:
+        conn.close()
+
+
+def tool_get_open_slots(args):
+    date_str        = args.get("date")
+    lesson_duration = int(args.get("lesson_duration_minutes", 60))
+    if not date_str:
+        return _err("date is required (YYYY-MM-DD)")
+    try:
+        d = _date.fromisoformat(date_str)
+    except ValueError:
+        return _err(f"Invalid date: {date_str!r}")
+    dow = d.weekday()
+    conn = _db()
+    try:
+        avail_rows = _rows(conn.execute(
+            "SELECT start_time, end_time FROM trainer_availability WHERE day_of_week=? AND active=1",
+            (dow,),
+        ).fetchall())
+        if not avail_rows:
+            return _ok({"date": date_str, "open_slots": []})
+        avail_mins = [(_time_to_min(r["start_time"]), _time_to_min(r["end_time"])) for r in avail_rows]
+        block_rows = _rows(conn.execute(
+            "SELECT start_time, end_time FROM trainer_blocks WHERE day_of_week=? AND active=1",
+            (dow,),
+        ).fetchall())
+        blocked_mins = [(_time_to_min(r["start_time"]), _time_to_min(r["end_time"])) for r in block_rows]
+        lesson_rows = _rows(conn.execute(
+            "SELECT scheduled_at FROM lessons WHERE DATE(scheduled_at)=? AND happened IS NULL",
+            (date_str,),
+        ).fetchall())
+        for lr in lesson_rows:
+            t = lr["scheduled_at"][11:16]
+            s = _time_to_min(t)
+            blocked_mins.append((s, s + lesson_duration))
+        free = _subtract_intervals(avail_mins, blocked_mins)
+        open_slots = []
+        for s, e in free:
+            cur = s
+            while cur + lesson_duration <= e:
+                open_slots.append(_min_to_time(cur))
+                cur += lesson_duration
+        return _ok({"date": date_str, "open_slots": open_slots})
+    finally:
+        conn.close()
+
+
 def tool_generate_upcoming_lessons(args):
     weeks_ahead = int(args.get("weeks_ahead", 8))
     today = _date.today()
@@ -657,30 +894,37 @@ def tool_generate_upcoming_lessons(args):
 
 
 TOOL_REGISTRY = {
-    "get_students":            tool_get_students,
-    "get_pending_lessons":     tool_get_pending_lessons,
-    "get_pending_overrides":   tool_get_pending_overrides,
-    "get_todays_lessons":      tool_get_todays_lessons,
-    "mark_lesson":             tool_mark_lesson,
-    "add_credit":              tool_add_credit,
-    "apply_payment":           tool_apply_payment,
-    "update_schedule":         tool_update_schedule,
-    "generate_balance":        tool_generate_balance,
-    "add_lesson":              tool_add_lesson,
-    "add_pending_request":     tool_add_pending_request,
-    "check_pending_requests":  tool_check_pending_requests,
-    "get_pending_requests":    tool_get_pending_requests,
-    "get_week_lessons":        tool_get_week_lessons,
-    "add_student":             tool_add_student,
-    "update_student":          tool_update_student,
-    "deactivate_student":      tool_deactivate_student,
-    "reactivate_student":      tool_reactivate_student,
-    "cancel_lesson":              tool_cancel_lesson,
-    "reschedule_lesson":          tool_reschedule_lesson,
-    "generate_upcoming_lessons":  tool_generate_upcoming_lessons,
-    "remove_schedule_day":        tool_remove_schedule_day,
-    "delete_pending_request":     tool_delete_pending_request,
-    "update_pending_request":     tool_update_pending_request,
+    "get_students":             tool_get_students,
+    "get_pending_lessons":      tool_get_pending_lessons,
+    "get_pending_overrides":    tool_get_pending_overrides,
+    "get_todays_lessons":       tool_get_todays_lessons,
+    "mark_lesson":              tool_mark_lesson,
+    "add_credit":               tool_add_credit,
+    "apply_payment":            tool_apply_payment,
+    "record_payment":           tool_record_payment,
+    "update_student_price":     tool_update_student_price,
+    "update_schedule":          tool_update_schedule,
+    "generate_balance":         tool_generate_balance,
+    "add_lesson":               tool_add_lesson,
+    "add_pending_request":      tool_add_pending_request,
+    "check_pending_requests":   tool_check_pending_requests,
+    "get_pending_requests":     tool_get_pending_requests,
+    "get_week_lessons":         tool_get_week_lessons,
+    "add_student":              tool_add_student,
+    "update_student":           tool_update_student,
+    "deactivate_student":       tool_deactivate_student,
+    "reactivate_student":       tool_reactivate_student,
+    "cancel_lesson":            tool_cancel_lesson,
+    "reschedule_lesson":        tool_reschedule_lesson,
+    "generate_upcoming_lessons": tool_generate_upcoming_lessons,
+    "remove_schedule_day":      tool_remove_schedule_day,
+    "delete_pending_request":   tool_delete_pending_request,
+    "update_pending_request":   tool_update_pending_request,
+    "get_trainer_availability": tool_get_trainer_availability,
+    "set_trainer_availability": tool_set_trainer_availability,
+    "add_trainer_block":        tool_add_trainer_block,
+    "remove_trainer_block":     tool_remove_trainer_block,
+    "get_open_slots":           tool_get_open_slots,
 }
 
 
@@ -717,14 +961,15 @@ TOOLS_MANIFEST = [
     },
     {
         "name": "mark_lesson",
-        "description": "Mark whether a scheduled lesson happened or was a no-show.",
+        "description": "Set the status of a lesson: happened, late_cancel, or cancelled.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "lesson_id": {"type": "integer"},
-                "happened": {"type": "boolean"},
+                "status":    {"type": "string", "enum": ["happened", "late_cancel", "cancelled"],
+                              "description": "happened=gerçekleşti, late_cancel=geç iptal (ücrete dahil), cancelled=iptal"},
             },
-            "required": ["lesson_id", "happened"],
+            "required": ["lesson_id", "status"],
         },
     },
     {
@@ -742,7 +987,7 @@ TOOLS_MANIFEST = [
     },
     {
         "name": "apply_payment",
-        "description": "Mark a set of confirmed lessons as paid and record the payment.",
+        "description": "Mark specific lessons as paid by lesson ID list (legacy).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -750,6 +995,30 @@ TOOLS_MANIFEST = [
                 "lesson_ids": {"type": "array", "items": {"type": "integer"}},
             },
             "required": ["student_id", "lesson_ids"],
+        },
+    },
+    {
+        "name": "record_payment",
+        "description": "Record a cash payment in lira. Automatically marks oldest unpaid lessons paid based on price_per_lesson.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "student_id":  {"type": "integer"},
+                "amount_lira": {"type": "integer", "description": "Total lira received"},
+            },
+            "required": ["student_id", "amount_lira"],
+        },
+    },
+    {
+        "name": "update_student_price",
+        "description": "Set the per-session price in lira for a student.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "student_id":       {"type": "integer"},
+                "price_per_lesson": {"type": "integer", "description": "Price in lira per session"},
+            },
+            "required": ["student_id", "price_per_lesson"],
         },
     },
     {
@@ -953,6 +1222,61 @@ TOOLS_MANIFEST = [
                 "notes":          {"type": "string"},
             },
             "required": ["request_id", "requested_date"],
+        },
+    },
+    {
+        "name": "get_trainer_availability",
+        "description": "Return the trainer's weekly availability windows.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "set_trainer_availability",
+        "description": "Set the trainer's availability window for a given day of week.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "day_of_week": {"type": "integer", "description": "0=Mon … 6=Sun"},
+                "start_time":  {"type": "string",  "description": "HH:MM"},
+                "end_time":    {"type": "string",  "description": "HH:MM"},
+            },
+            "required": ["day_of_week", "start_time", "end_time"],
+        },
+    },
+    {
+        "name": "add_trainer_block",
+        "description": "Add a recurring block (e.g. group class, appointment) within availability.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "day_of_week": {"type": "integer", "description": "0=Mon … 6=Sun"},
+                "start_time":  {"type": "string",  "description": "HH:MM"},
+                "end_time":    {"type": "string",  "description": "HH:MM"},
+            },
+            "required": ["day_of_week", "start_time", "end_time"],
+        },
+    },
+    {
+        "name": "remove_trainer_block",
+        "description": "Deactivate a recurring trainer block by its ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "block_id": {"type": "integer"},
+            },
+            "required": ["block_id"],
+        },
+    },
+    {
+        "name": "get_open_slots",
+        "description": "Return open lesson slots for a date (availability minus blocks minus booked lessons).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date":                    {"type": "string",  "description": "YYYY-MM-DD"},
+                "lesson_duration_minutes": {"type": "integer", "description": "Default 60"},
+            },
+            "required": ["date"],
         },
     },
 ]
