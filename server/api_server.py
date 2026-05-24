@@ -46,7 +46,8 @@ ANTHROPIC_URL        = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL         = "claude-sonnet-4-20250514"
 
 TWILIO_ACCOUNT_SID   = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN    = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_API_KEY       = os.getenv('TWILIO_API_KEY')       # SK... — preferred over Auth Token
+TWILIO_API_SECRET    = os.getenv('TWILIO_API_SECRET')
 TWILIO_WHATSAPP_FROM = os.getenv('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
 
 _default_db = Path(__file__).parent.parent / "db" / "trainer.db"
@@ -1399,12 +1400,13 @@ def _save_wa_session(phone_number: str, messages: list[dict]) -> None:
 
 
 def _send_whatsapp(to: str, body: str) -> None:
-    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        logger.warning("Twilio credentials not set — skipping send")
+    if not TWILIO_ACCOUNT_SID or not TWILIO_API_KEY or not TWILIO_API_SECRET:
+        logger.warning("Twilio credentials not set (need TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET) — skipping send")
         return
     try:
         from twilio.rest import Client
-        Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
+        # API Key auth: Client(api_key, api_secret, account_sid)
+        Client(TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_ACCOUNT_SID).messages.create(
             from_=TWILIO_WHATSAPP_FROM,
             to=to,
             body=body,
